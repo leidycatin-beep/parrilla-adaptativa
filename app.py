@@ -185,9 +185,13 @@ def validar_datos(df):
 def preparar(df, formatos):
     df = df.copy()
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce", dayfirst=True)
-    for c in ["vistas", "espectadores", "interacciones", "pct_inter_no_seguidores",
-              "envios", "guardados", "comentarios"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    # Conteos: se quitan puntos y comas de miles (1.047 o 1,047 -> 1047)
+    for c in ["vistas", "espectadores", "interacciones", "envios", "guardados", "comentarios"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(r"[.,\s]", "", regex=True), errors="coerce").fillna(0)
+    # Porcentaje: se acepta coma decimal (12,5 -> 12.5)
+    df["pct_inter_no_seguidores"] = pd.to_numeric(
+        df["pct_inter_no_seguidores"].astype(str).str.replace("%", "").str.replace(",", ".").str.strip(),
+        errors="coerce").fillna(0)
     df["planeado"] = df["planeado"].astype(str).str.strip().str.lower().isin(["si", "sí", "1", "true"])
     if "tipo" not in df.columns:
         df["tipo"] = df["formato"].map(lambda f: formatos.get(f, {}).get("tipo", "Reel"))
@@ -491,7 +495,13 @@ elif pantalla.startswith("3"):
     if origen == "Subir mi CSV":
         archivo = st.file_uploader("Archivo CSV con las columnas de la plantilla", type="csv")
         if archivo:
-            df = pd.read_csv(archivo)
+            # Detecta el separador (coma o punto y coma, como guarda Excel en español)
+            try:
+                df = pd.read_csv(archivo, sep=None, engine="python", encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                archivo.seek(0)
+                df = pd.read_csv(archivo, sep=None, engine="python", encoding="latin-1")
+            df.columns = [str(c).strip().lower() for c in df.columns]
     else:
         try:
             df = pd.read_csv(Path(__file__).parent / "datos_ejemplo.csv")
