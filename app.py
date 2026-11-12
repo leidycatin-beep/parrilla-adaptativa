@@ -11,6 +11,8 @@ from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 
+import requests
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -97,7 +99,7 @@ FORMATOS_BASE = {
             ["0-3 s", "Resultado final primero + texto: «{gancho}»"],
             ["3-25 s", "Pasos numerados (máximo 3) aplicados a {angulo}"],
             ["Cierre", "{cta}"]]},
-    "Anuncio o promoción": {
+    "Anuncio o promoción": {"proponer": False,
         "tipo": "Reel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": False,
         "estructura": [
             ["0-3 s", "El anuncio en pantalla: {angulo}"],
@@ -386,8 +388,12 @@ def partir_angulo(linea):
     """«Referencia interna | lo que se dice en público». Sin «|», todo es público."""
     if "|" in str(linea):
         ref, pub = [x.strip() for x in str(linea).split("|", 1)]
-        return ref, pub or ref
-    return "", str(linea).strip()
+        return ref, limpiar_publico(pub or ref)
+    return "", limpiar_publico(linea)
+
+
+def limpiar_publico(texto):
+    return re.sub(r"^\s*inspiraci[oó]n\s*:\s*", "", str(texto).strip(), flags=re.IGNORECASE)
 
 
 def guion(nombre, formato, angulo, pilar, objetivo, persona, rng):
@@ -431,6 +437,49 @@ def prompt_ia(idea, marca, reglas):
     )
 
 
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def modelo_gemini(clave):
+    """Busca un modelo Flash disponible para la clave (los nombres cambian con el tiempo)."""
+    r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
+    r.raise_for_status()
+    nombres = [m["name"] for m in r.json().get("models", [])
+               if "generateContent" in m.get("supportedGenerationMethods", []) and "flash" in m["name"]]
+    estables = [n for n in nombres if "preview" not in n and "exp" not in n and "lite" not in n]
+    elegido = (sorted(estables) or sorted(nombres))
+    if not elegido:
+        raise RuntimeError("No hay modelos Flash disponibles para esta clave.")
+    return elegido[-1]
+
+
+def escribir_guion_ia(idea, marca, reglas, clave):
+    instruccion = prompt_ia(idea, marca, reglas) + (
+        "\n\nEntrega el guion COMPLETO y listo para grabar, en español de Colombia, con estas secciones:\n"
+        "1. Gancho (texto exacto en pantalla de los primeros 3 segundos).\n"
+        "2. Guion por bloques de tiempo: qué se ve (toma), texto en pantalla y voz en off palabra por palabra.\n"
+        "3. Música o ambiente sugerido.\n"
+        "4. Descripción para la publicación (máximo 3 líneas) y 5 hashtags.\n"
+        "No inventes datos de precios, materiales ni certificaciones que no aparezcan aquí.")
+    modelo = modelo_gemini(clave)
+    r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=60,
+                      json={"contents": [{"parts": [{"text": instruccion}]}]})
+    if r.status_code == 429:
+        raise RuntimeError("Se alcanzó el límite gratuito de la IA por hoy. Intenta más tarde o usa "
+                           "«Instrucción para tu asistente de IA».")
+    r.raise_for_status()
+    partes = r.json()["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in partes).strip()
+
+
+def clave_ia():
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        return ""
+
+
 def indicadores_plan(reg, planeadas):
     publicadas = len(reg)
     segun_plan = int(reg["planeado"].sum()) if publicadas else 0
@@ -446,7 +495,8 @@ def generar_semana(df, formatos, personalidades, piezas, angulos, pilares, descu
     por_nombre = {p["personalidad"]: p for p in personalidades}
     for tipo in TIPOS:
         n = int(piezas.get(tipo, 0))
-        opciones = [f for f, v in formatos.items() if v.get("tipo", "Reel") == tipo]
+        # Los anuncios (ferias, lanzamientos) dependen de eventos: no los propone el motor
+        opciones = [f for f, v in formatos.items() if v.get("tipo", "Reel") == tipo and v.get("proponer", True)]
         if n <= 0 or not opciones:
             continue
         datos_tipo = df[df["tipo"] == tipo]
@@ -729,11 +779,14 @@ elif pantalla.startswith("5"):
     st.text_input("Temática analizada", "Accesorios para el cabello")
     ss.muestra = st.data_editor(ss.muestra, num_rows="dynamic", width="stretch",
                                 column_config={"cantidad": st.column_config.NumberColumn(min_value=0, step=1)})
-    st.caption("Si la inspiración es una persona o una marca, escribe **referencia interna | lo que se dice en "
+    st.caption("Escribe un tema o inspiración por fila y presiona **Enter**. No tiene que ser una inspiración: "
+               "puede ser cualquier tema, como «texturas del terciopelo» o «cómo combinarla con ropa de oficina». "
+               "Si la inspiración es una persona o una marca, escribe **referencia interna | lo que se dice en "
                "público**. Ejemplo: «Shakira | la danza árabe y sus vestuarios con brillo». El guion solo usa la parte "
                "pública; la referencia queda como nota para el equipo.")
-    cand = st.text_area("Ángulos o inspiraciones propias (una por línea)", "\n".join(ss.candidatos))
-    ss.candidatos = [c.strip() for c in cand.splitlines() if c.strip()]
+    cand = st.data_editor(pd.DataFrame({"tema o inspiración": ss.candidatos or [""]}), num_rows="dynamic",
+                          hide_index=True, width="stretch", key="ed_cand")
+    ss.candidatos = [str(c).strip() for c in cand["tema o inspiración"].fillna("") if str(c).strip()]
     if st.button("Sugerir una inspiración"):
         sug = "Inspiración: " + rng.choice(BANCO_INSPIRACION)
         ss.candidatos.append(sug)
@@ -758,8 +811,30 @@ elif pantalla.startswith("6"):
     if not angulos:
         angulos = ["Inspiración: " + x for x in BANCO_INSPIRACION]
     pilares = ss.marca["pilares"] or ["Marca"]
+    with st.expander("➕ Agregar una idea puntual (sin cambiar el resto de la semana)"):
+        with st.form("puntual", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            f_p = c1.selectbox("Formato", list(ss.formatos))
+            o_p = c2.selectbox("Objetivo", list(CTA))
+            tema_p = st.text_input("Tema o inspiración", placeholder="Ejemplo: texturas del terciopelo y la pedrería")
+            c3, c4 = st.columns(2)
+            per_p = c3.selectbox("Personalidad (si el formato la usa)", ["La elige la app"] +
+                                 [p["personalidad"] for p in ss.personalidades])
+            fecha_p = c4.date_input("Fecha de publicación", date.today() + timedelta(days=1))
+            if st.form_submit_button("Agregar idea", type="primary"):
+                if not tema_p.strip():
+                    st.error("Escribe el tema de la idea.")
+                else:
+                    porn = {p["personalidad"]: p for p in ss.personalidades}
+                    persona = porn.get(per_p) or (ss.personalidades[rng.integers(len(ss.personalidades))]
+                                                  if ss.personalidades else None)
+                    nueva = guion(f_p, ss.formatos[f_p], tema_p, pilares[0], o_p, persona, rng)
+                    nueva.update(puntual=True, fecha_fija=fecha_p)
+                    ss.ideas.append(nueva)
+                    st.success("Idea agregada. Revísala abajo, escríbele el guion y apruébala.")
     if st.button("Generar la semana", type="primary"):
-        ss.ideas = generar_semana(ss.df, ss.formatos, ss.personalidades, ss.marca["piezas"], angulos, pilares,
+        puntuales = [x for x in ss.ideas if x.get("puntual")]
+        ss.ideas = puntuales + generar_semana(ss.df, ss.formatos, ss.personalidades, ss.marca["piezas"], angulos, pilares,
                                   ss.descuento, rng)
     personas = {p["personalidad"]: p for p in ss.personalidades}
     for tipo in TIPOS:
@@ -770,6 +845,8 @@ elif pantalla.startswith("6"):
             titulo = f"{idea['formato']} · {idea['angulo']} · objetivo {idea['objetivo']}"
             if idea.get("referencia"):
                 titulo += f" · ref. interna: {idea['referencia']}"
+            if idea.get("puntual"):
+                titulo = "📌 " + titulo + f" · {idea['fecha_fija']:%d/%m}"
             if idea.get("personalidad"):
                 titulo += f" · {idea['personalidad']}"
             with st.expander(titulo, expanded=not idea["aprobada"]):
@@ -777,10 +854,33 @@ elif pantalla.startswith("6"):
                                      key=f"g{i}", height=180)
                 for a in revisar_reglas(texto, ss.reglas, idea["permite_tecnica"]):
                     st.warning(a)
+                if st.button("✨ Escribir guion completo con IA", key=f"ia{i}"):
+                    clave = clave_ia()
+                    if not clave:
+                        st.info("La IA no está configurada en esta app. Usa «Instrucción para tu asistente de IA» "
+                                "o configura la clave GEMINI_API_KEY en los Secrets de Streamlit.")
+                    else:
+                        try:
+                            with st.spinner("Escribiendo el guion…"):
+                                idea["pasos"] = [(t, d) for t, d in idea["pasos"]]
+                                idea["guion_ia"] = escribir_guion_ia(
+                                    {**idea, "pasos": [(t, d) for t, d in
+                                                       [l.split(": ", 1) if ": " in l else ("", l)
+                                                        for l in texto.splitlines()]]},
+                                    ss.marca["nombre"] or "la marca", ss.reglas, clave)
+                        except Exception as e:
+                            st.error(f"No se pudo generar el guion: {e}")
+                if idea.get("guion_ia"):
+                    idea["guion_ia"] = st.text_area("Guion completo (IA, editable antes de aprobar)",
+                                                    idea["guion_ia"], key=f"gi{i}", height=320)
+                    for a in revisar_reglas(idea["guion_ia"], ss.reglas, idea["permite_tecnica"]):
+                        st.warning(a)
+                    st.caption("Revisa el guion antes de aprobarlo: la IA puede equivocarse. "
+                               "No incluyas datos personales de clientes en las instrucciones.")
                 c1, c2, c3, c4 = st.columns(4)
                 if c1.button("Aprobar", key=f"a{i}"):
                     idea["aprobada"] = True
-                    idea["texto"] = texto
+                    idea["texto"] = idea.get("guion_ia") or texto
                 if c2.button("Regenerar", key=f"r{i}"):
                     persona = personas.get(idea.get("personalidad")) or (
                         ss.personalidades[rng.integers(len(ss.personalidades))] if ss.personalidades else None)
@@ -810,7 +910,7 @@ elif pantalla.startswith("7"):
     for tipo in TIPOS:
         grupo = [x for x in aprobadas if x["tipo"] == tipo]
         for j, x in enumerate(grupo):
-            dia = inicio + timedelta(days=(j * 7) // len(grupo))
+            dia = x.get("fecha_fija") or inicio + timedelta(days=(j * 7) // len(grupo))
             filas.append({"fecha": dia, "dia": DIAS[dia.weekday()], "tipo": tipo, "formato": x["formato"],
                           "angulo": x["angulo"], "referencia_interna": x.get("referencia", ""), "personalidad": x.get("personalidad", ""), "pilar": x["pilar"],
                           "objetivo": x["objetivo"], "horas": x["horas"], "gancho": x["gancho"]})
