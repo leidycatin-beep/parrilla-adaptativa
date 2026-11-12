@@ -326,7 +326,7 @@ def posteriores(df, columna, opciones, descuento, fuerza_prior=200):
     - Memoria que se desvanece: peso = descuento ** (posición desde la pieza más reciente)."""
     df = df.sort_values("fecha").reset_index(drop=True)
     tasa = df["envios"].sum() / max(df["espectadores"].sum(), 1) if len(df) else 0.01
-    a0, b0 = 1 + tasa * fuerza_prior, 1 + (1 - tasa) * fuerza_prior
+    a0, b0 = max(tasa * fuerza_prior, 0.5), max((1 - tasa) * fuerza_prior, 0.5)
     w = descuento ** ((len(df) - 1) - np.arange(len(df)))
     filas = []
     for o in opciones:
@@ -339,12 +339,19 @@ def posteriores(df, columna, opciones, descuento, fuerza_prior=200):
     return pd.DataFrame(filas).set_index("opcion")
 
 
-def thompson(post, n, rng):
+def thompson(post, n, rng, excluir=(), variar=True):
     """En cada espacio muestrea una tasa probable por opción y elige la mayor:
-    explota lo que funciona sin dejar de explorar las opciones con pocos datos."""
+    explota lo que funciona sin dejar de explorar las opciones con pocos datos.
+    Con variar=True no repite una opción en la misma semana mientras queden otras disponibles."""
     elegidos = []
     for _ in range(n):
-        muestras = {o: rng.beta(r.alpha, r.beta) for o, r in post.iterrows()}
+        usadas = set(excluir) | set(elegidos) if variar else set(excluir)
+        familia = lambda o: str(o).split(" (")[0]  # p. ej., las dos versiones de Artelier son una familia
+        familias = {familia(u) for u in usadas}
+        candidatas = post[[familia(o) not in familias for o in post.index]]
+        if candidatas.empty:
+            candidatas = post
+        muestras = {o: rng.beta(r.alpha, r.beta) for o, r in candidatas.iterrows()}
         elegidos.append(max(muestras, key=muestras.get))
     return elegidos
 
@@ -375,7 +382,16 @@ def revisar_reglas(texto, reglas, permite_tecnica):
     return alertas
 
 
+def partir_angulo(linea):
+    """«Referencia interna | lo que se dice en público». Sin «|», todo es público."""
+    if "|" in str(linea):
+        ref, pub = [x.strip() for x in str(linea).split("|", 1)]
+        return ref, pub or ref
+    return "", str(linea).strip()
+
+
 def guion(nombre, formato, angulo, pilar, objetivo, persona, rng):
+    referencia, angulo = partir_angulo(angulo)
     usa_p = bool(formato.get("usa_personalidad", False) and persona and persona.get("personalidad"))
     gancho = rng.choice(GANCHOS_PERSONALIDAD if usa_p else GANCHOS).format(angulo=angulo.lower())
     cta = CTA[objetivo]
@@ -391,7 +407,8 @@ def guion(nombre, formato, angulo, pilar, objetivo, persona, rng):
             pasos.append((t, d.format(**datos)))
         except (KeyError, IndexError, ValueError):
             pasos.append((t, d))
-    return {"formato": nombre, "tipo": formato.get("tipo", "Reel"), "angulo": angulo, "pilar": pilar,
+    return {"formato": nombre, "tipo": formato.get("tipo", "Reel"), "angulo": angulo, "referencia": referencia,
+            "pilar": pilar,
             "objetivo": objetivo, "personalidad": datos["personalidad"], "gancho": gancho, "pasos": pasos,
             "horas": float(formato["horas"]), "permite_tecnica": bool(formato.get("permite_tecnica")),
             "aprobada": False}
@@ -433,7 +450,15 @@ def generar_semana(df, formatos, personalidades, piezas, angulos, pilares, descu
         if n <= 0 or not opciones:
             continue
         datos_tipo = df[df["tipo"] == tipo]
-        elegidos = thompson(posteriores(datos_tipo, "formato", opciones, descuento), n, rng)
+        # 1) Formatos fijos (por ejemplo, una serie que debe salir cada semana)
+        fijos = []
+        for f in opciones:
+            fijos += [f] * int(formatos[f].get("fijo_semana", 0) or 0)
+        fijos = fijos[:n]
+        # 2) El resto de espacios los decide el motor adaptativo
+        libres = n - len(fijos)
+        elegidos = fijos + (thompson(posteriores(datos_tipo, "formato", opciones, descuento), libres, rng,
+                                     excluir=set(fijos), variar=False) if libres > 0 else [])
         objetivos = (["Alcance", "Comunidad", "Conversión"] * 10)[:n]
         for f, o in zip(elegidos, objetivos):
             persona = por_nombre.get(thompson(pers_post, 1, rng)[0]) if pers_post is not None else None
@@ -517,13 +542,21 @@ elif pantalla.startswith("2"):
 
     with t1:
         st.write("Formatos que la app puede proponer. Ajusta las horas reales o crea formatos nuevos.")
+        st.caption("**horas**: tiempo real de producción de una pieza · **fijo_semana**: cuántas piezas de este "
+                   "formato deben salir sí o sí cada semana (0 = lo decide el motor) · **permite_tecnica**: solo en "
+                   "formatos donde se puede mostrar la técnica · **usa_personalidad**: la pieza se adapta a una "
+                   "personalidad (voz, música y vestuario).")
         resumen = pd.DataFrame([{"formato": k, "tipo": v.get("tipo", "Reel"), "horas": v["horas"],
+                                 "fijo_semana": int(v.get("fijo_semana", 0) or 0),
                                  "permite_tecnica": v["permite_tecnica"], "usa_personalidad": v["usa_personalidad"]}
                                 for k, v in ss.formatos.items()])
         editado = st.data_editor(resumen, disabled=["formato", "tipo"], hide_index=True, width="stretch",
-                                 key="ed_fmt")
+                                 key="ed_fmt",
+                                 column_config={"fijo_semana": st.column_config.NumberColumn(min_value=0, max_value=7,
+                                                                                             step=1)})
         for r in editado.itertuples():
-            ss.formatos[r.formato].update(horas=float(r.horas), permite_tecnica=bool(r.permite_tecnica),
+            ss.formatos[r.formato].update(horas=float(r.horas), fijo_semana=int(r.fijo_semana or 0),
+                                          permite_tecnica=bool(r.permite_tecnica),
                                           usa_personalidad=bool(r.usa_personalidad))
         ver = st.selectbox("Ver la estructura de", list(ss.formatos))
         st.table(pd.DataFrame(ss.formatos[ver]["estructura"], columns=["Tiempo / lámina", "Qué pasa"]))
@@ -696,6 +729,9 @@ elif pantalla.startswith("5"):
     st.text_input("Temática analizada", "Accesorios para el cabello")
     ss.muestra = st.data_editor(ss.muestra, num_rows="dynamic", width="stretch",
                                 column_config={"cantidad": st.column_config.NumberColumn(min_value=0, step=1)})
+    st.caption("Si la inspiración es una persona o una marca, escribe **referencia interna | lo que se dice en "
+               "público**. Ejemplo: «Shakira | la danza árabe y sus vestuarios con brillo». El guion solo usa la parte "
+               "pública; la referencia queda como nota para el equipo.")
     cand = st.text_area("Ángulos o inspiraciones propias (una por línea)", "\n".join(ss.candidatos))
     ss.candidatos = [c.strip() for c in cand.splitlines() if c.strip()]
     if st.button("Sugerir una inspiración"):
@@ -732,6 +768,8 @@ elif pantalla.startswith("6"):
             st.subheader(f"{tipo}s")
         for i, idea in grupo:
             titulo = f"{idea['formato']} · {idea['angulo']} · objetivo {idea['objetivo']}"
+            if idea.get("referencia"):
+                titulo += f" · ref. interna: {idea['referencia']}"
             if idea.get("personalidad"):
                 titulo += f" · {idea['personalidad']}"
             with st.expander(titulo, expanded=not idea["aprobada"]):
@@ -774,7 +812,7 @@ elif pantalla.startswith("7"):
         for j, x in enumerate(grupo):
             dia = inicio + timedelta(days=(j * 7) // len(grupo))
             filas.append({"fecha": dia, "dia": DIAS[dia.weekday()], "tipo": tipo, "formato": x["formato"],
-                          "angulo": x["angulo"], "personalidad": x.get("personalidad", ""), "pilar": x["pilar"],
+                          "angulo": x["angulo"], "referencia_interna": x.get("referencia", ""), "personalidad": x.get("personalidad", ""), "pilar": x["pilar"],
                           "objetivo": x["objetivo"], "horas": x["horas"], "gancho": x["gancho"]})
     ss.parrilla = pd.DataFrame(filas).sort_values(["fecha", "tipo"]).reset_index(drop=True)
     horas = ss.parrilla["horas"].sum()
