@@ -25,7 +25,7 @@ COLUMNAS = [
     "interacciones", "pct_inter_no_seguidores", "envios", "guardados",
     "comentarios", "planeado",
 ]
-OPCIONALES = ["tipo", "personalidad"]  # columnas que el CSV puede traer o no
+OPCIONALES = ["tipo", "personalidad", "pagado"]  # columnas que el CSV puede traer o no
 TIPOS = ["Reel", "Carrusel", "Historia"]
 
 # Marcadores disponibles en la estructura:
@@ -72,6 +72,37 @@ FORMATOS_BASE = {
             ["3-25 s", "La pieza durante el día real: {angulo}"],
             ["25-35 s", "Estado de la pieza al final del día"],
             ["Cierre", "{cta}"]]},
+    "Persona luciendo la pieza": {
+        "tipo": "Reel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": True,
+        "estructura": [
+            ["0-3 s", "Mujer de estilo {personalidad} acomodándose la pieza + texto: «{gancho}»"],
+            ["3-20 s", "Momentos de su día con la pieza puesta ({vestuario}); música: {musica}"],
+            ["Cierre", "{cta}"]]},
+    "Inspiración temática": {
+        "tipo": "Reel", "horas": 1.5, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["0-3 s", "La inspiración en pantalla: {angulo} + texto: «{gancho}»"],
+            ["3-15 s", "Paralelo entre la inspiración y los detalles de la pieza"],
+            ["15-25 s", "La pieza terminada"],
+            ["Cierre", "{cta}"]]},
+    "Mensaje de marca": {
+        "tipo": "Reel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["0-3 s", "Frase que rompe una creencia: «{gancho}»"],
+            ["3-25 s", "El mensaje de la marca sobre {angulo}, con las piezas de fondo"],
+            ["Cierre", "{cta}"]]},
+    "Tutorial": {
+        "tipo": "Reel", "horas": 1.5, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["0-3 s", "Resultado final primero + texto: «{gancho}»"],
+            ["3-25 s", "Pasos numerados (máximo 3) aplicados a {angulo}"],
+            ["Cierre", "{cta}"]]},
+    "Anuncio o promoción": {
+        "tipo": "Reel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["0-3 s", "El anuncio en pantalla: {angulo}"],
+            ["3-15 s", "Dónde, cuándo y qué piezas"],
+            ["Cierre", "{cta}"]]},
     # ---------------- Carruseles ----------------
     "Carrusel ¿Cuál eres tú? (identidad)": {
         "tipo": "Carrusel", "horas": 1.5, "permite_tecnica": False, "usa_personalidad": True,
@@ -94,6 +125,18 @@ FORMATOS_BASE = {
             ["Láminas 2-5", "Un consejo por lámina sobre {angulo}"],
             ["Lámina 6", "Resumen"],
             ["Lámina 7", "{cta}"]]},
+    "Carrusel de producto o catálogo": {
+        "tipo": "Carrusel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["Lámina 1", "Portada: la pieza protagonista + «{gancho}»"],
+            ["Láminas 2-4", "Detalles, colores y la pieza puesta en un uso cotidiano"],
+            ["Lámina 5", "{cta}"]]},
+    "Carrusel mensaje de marca": {
+        "tipo": "Carrusel", "horas": 1.0, "permite_tecnica": False, "usa_personalidad": False,
+        "estructura": [
+            ["Lámina 1", "Frase que rompe una creencia: «{gancho}»"],
+            ["Láminas 2-4", "El mensaje de la marca sobre {angulo}, una idea por lámina"],
+            ["Lámina 5", "{cta}"]]},
     # ---------------- Historias ----------------
     "Historia de interacción (encuesta o pregunta)": {
         "tipo": "Historia", "horas": 0.25, "permite_tecnica": False, "usa_personalidad": True,
@@ -191,7 +234,7 @@ def preparar(df, formatos):
     # Porcentaje: se acepta coma decimal (12,5 -> 12.5)
     df["pct_inter_no_seguidores"] = pd.to_numeric(
         df["pct_inter_no_seguidores"].astype(str).str.replace("%", "").str.replace(",", ".").str.strip(),
-        errors="coerce").fillna(0)
+        errors="coerce")  # puede quedar vacío: Meta no entrega este dato
     df["planeado"] = df["planeado"].astype(str).str.strip().str.lower().isin(["si", "sí", "1", "true"])
     if "tipo" not in df.columns:
         df["tipo"] = df["formato"].map(lambda f: formatos.get(f, {}).get("tipo", "Reel"))
@@ -199,7 +242,68 @@ def preparar(df, formatos):
     if "personalidad" not in df.columns:
         df["personalidad"] = ""
     df["personalidad"] = df["personalidad"].fillna("")
+    if "pagado" not in df.columns:
+        df["pagado"] = "no"
+    df["pagado"] = df["pagado"].astype(str).str.strip().str.lower().isin(["si", "sí", "1", "true"])
     return df.sort_values("fecha").reset_index(drop=True)
+
+
+REGLAS_CLASIFICACION = [  # (tipo, palabras clave, formato) en orden de prioridad
+    ("Reel", ["feria", "disponible a partir", "página web", "pagina web", "lanzamiento"], "Anuncio o promoción"),
+    ("Reel", ["inspirada", "inspiración", "inspiracion", "inspirándonos", "inspirado"], "Inspiración temática"),
+    ("Reel", ["proceso", "process", "cobra vida", "creando", "pedido en proceso"], "Proceso (detrás de cámaras)"),
+    ("Reel", ["no es el accesorio", "cómo te hace sentir", "historia", "hecho en colombia", "zona de confort",
+              "genérico"], "Mensaje de marca"),
+    ("Reel", ["tips", "paso a paso", "cómo usar"], "Tutorial"),
+    ("Reel", ["cuál eliges", "un plan simple", "outfit"], "Persona luciendo la pieza"),
+    ("Carrusel", ["tips", "historia", "estilos de", "sabías"], "Carrusel educativo"),
+    ("Carrusel", ["inspiración", "inspiracion", "inspirada"], "Carrusel board de inspiración"),
+    ("Carrusel", ["evolucionando", "no necesitas", "creemos"], "Carrusel mensaje de marca"),
+]
+DEFECTO_TIPO = {"Reel": "Primer plano de producto", "Carrusel": "Carrusel de producto o catálogo",
+                "Historia": "Historia de producto"}
+
+
+def clasificar(texto, tipo, formatos):
+    t = str(texto).lower()
+    for tp, claves, fmt in REGLAS_CLASIFICACION:
+        if tp == tipo and fmt in formatos and any(k in t for k in claves):
+            return fmt
+    return DEFECTO_TIPO.get(tipo, list(formatos)[0])
+
+
+def es_exportacion_meta(df):
+    return {"hora de publicación", "alcance", "veces que se compartió"} <= {c.lower() for c in df.columns}
+
+
+def desde_meta(df, formatos):
+    """Convierte la exportación de Meta Business Suite (Estadísticas > Contenido) al formato de la app."""
+    df = df.rename(columns={c: c.lower() for c in df.columns})
+    # Solo la cuenta propia (la más frecuente): las colaboraciones con otras cuentas se excluyen
+    if "nombre de usuario de la cuenta" in df.columns:
+        propia = df["nombre de usuario de la cuenta"].mode()[0]
+        df = df[df["nombre de usuario de la cuenta"] == propia]
+    tipos = {"reel de instagram": "Reel", "secuencia de instagram": "Carrusel", "imagen de instagram": "Carrusel",
+             "historia de instagram": "Historia"}
+    tipo = df["tipo de publicación"].str.lower().map(tipos).fillna("Reel")
+    desc = df["descripción"].fillna("")
+    num = lambda c: pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+    out = pd.DataFrame({
+        "fecha": pd.to_datetime(df["hora de publicación"], format="%m/%d/%Y %H:%M", errors="coerce")
+                   .dt.strftime("%d/%m/%Y"),
+        "titulo": desc.str.split("\n").str[0].str.strip().str[:70],
+        "formato": [clasificar(d, t, formatos) for d, t in zip(desc, tipo)],
+        "angulo": "", "pilar": "",
+        "vistas": num("visualizaciones"), "espectadores": num("alcance"),
+        "interacciones": num("me gusta") + num("veces que se compartió") + num("comentarios") + num("veces que se guardó"),
+        "pct_inter_no_seguidores": np.nan,
+        "envios": num("veces que se compartió"), "guardados": num("veces que se guardó"),
+        "comentarios": num("comentarios"), "planeado": "no", "tipo": tipo.values, "personalidad": "",
+    })
+    # Posible pauta: alcance mayor que las visualizaciones o muy por encima de lo normal de la cuenta
+    mediana = out["espectadores"].median()
+    out["pagado"] = np.where((out["espectadores"] > out["vistas"]) | (out["espectadores"] > 4 * mediana), "si", "no")
+    return out.reset_index(drop=True)
 
 
 def diagnostico(df, por="formato"):
@@ -320,6 +424,7 @@ def indicadores_plan(reg, planeadas):
 def generar_semana(df, formatos, personalidades, piezas, angulos, pilares, descuento, rng):
     ideas = []
     pers_names = [p["personalidad"] for p in personalidades if p.get("personalidad")]
+    df = df[~df["pagado"]] if "pagado" in df.columns else df
     pers_post = posteriores(df, "personalidad", pers_names, descuento) if pers_names else None
     por_nombre = {p["personalidad"]: p for p in personalidades}
     for tipo in TIPOS:
@@ -354,6 +459,7 @@ ss.setdefault("ideas", [])
 ss.setdefault("parrilla", None)
 ss.setdefault("registro", pd.DataFrame(columns=COLUMNAS + OPCIONALES))
 ss.setdefault("descuento", 0.9)
+ss.setdefault("meta_raw", None)
 rng = np.random.default_rng()
 
 # ---------------------------------------------------------------------------
@@ -501,13 +607,32 @@ elif pantalla.startswith("3"):
             except UnicodeDecodeError:
                 archivo.seek(0)
                 df = pd.read_csv(archivo, sep=None, engine="python", encoding="latin-1")
-            df.columns = [str(c).strip().lower() for c in df.columns]
+            if es_exportacion_meta(df):
+                ss.meta_raw = desde_meta(df, ss.formatos)
+                df = None
+            else:
+                df.columns = [str(c).strip().lower() for c in df.columns]
     else:
         try:
             df = pd.read_csv(Path(__file__).parent / "datos_ejemplo.csv")
             st.caption("Datos inventados solo para demostrar el funcionamiento. No son de ninguna marca real.")
         except FileNotFoundError:
             st.error("No se encontró datos_ejemplo.csv junto a app.py.")
+    if origen == "Subir mi CSV" and ss.get("meta_raw") is not None:
+        st.info("Detecté una **exportación de Meta Business Suite**. La app clasificó cada publicación por formato "
+                "y marcó las que parecen pautadas (alcance mayor que las visualizaciones). **Revisa y corrige** las "
+                "columnas «formato» y «pagado» antes de usar los datos.")
+        edit = st.data_editor(
+            ss.meta_raw, width="stretch", hide_index=True, key="ed_meta",
+            column_config={"formato": st.column_config.SelectboxColumn(options=list(ss.formatos), required=True),
+                           "pagado": st.column_config.SelectboxColumn(options=["si", "no"], required=True),
+                           "planeado": st.column_config.SelectboxColumn(options=["si", "no"], required=True)})
+        if st.button("Usar estos datos", type="primary"):
+            ss.df = preparar(edit, ss.formatos)
+            st.success(f"{len(ss.df)} publicaciones cargadas ({int(ss.df['pagado'].sum())} marcadas como pagadas, "
+                       "que no entran al aprendizaje).")
+        st.download_button("Descargar datos revisados (CSV)", edit.to_csv(index=False).encode("utf-8"),
+                           "contenido_revisado.csv", "text/csv")
     if df is not None:
         faltan = validar_datos(df)
         if faltan:
@@ -529,17 +654,26 @@ elif pantalla.startswith("4"):
     if ss.df is None:
         st.warning("Primero carga tus datos en el paso 3.")
         st.stop()
+    base_df = ss.df[~ss.df["pagado"]]
+    if ss.df["pagado"].sum():
+        st.caption(f"Se excluyen {int(ss.df['pagado'].sum())} publicaciones pagadas: la pauta no refleja el "
+                   "desempeño orgánico del formato.")
+    sin = int((base_df["espectadores"] <= 0).sum())
+    if sin:
+        st.warning(f"{sin} piezas no tienen espectadores: no aportan al aprendizaje del motor. "
+                   "Completa espectadores y envíos en tu CSV y vuelve a cargarlo.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Piezas analizadas", len(ss.df))
-    c2.metric("Tasa de envíos global", f"{ss.df['envios'].sum() / max(ss.df['espectadores'].sum(), 1) * 100:.2f} %")
-    c3.metric("Interacción de no seguidores (promedio)", f"{ss.df['pct_inter_no_seguidores'].mean():.1f} %")
+    c1.metric("Piezas orgánicas analizadas", len(base_df))
+    c2.metric("Tasa de envíos global", f"{base_df['envios'].sum() / max(base_df['espectadores'].sum(), 1) * 100:.2f} %")
+    pct = base_df["pct_inter_no_seguidores"].mean()
+    c3.metric("Interacción de no seguidores (promedio)", "No disponible" if pd.isna(pct) else f"{pct:.1f} %")
     st.subheader("Por tipo de contenido")
-    st.dataframe(diagnostico(ss.df, "tipo"), width="stretch")
+    st.dataframe(diagnostico(base_df, "tipo"), width="stretch")
     st.subheader("Por formato")
-    d = diagnostico(ss.df, "formato")
+    d = diagnostico(base_df, "formato")
     st.dataframe(d, width="stretch")
     st.bar_chart(d["tasa_envios_%"])
-    con_p = ss.df[ss.df["personalidad"] != ""]
+    con_p = base_df[base_df["personalidad"] != ""]
     if len(con_p):
         st.subheader("Por personalidad")
         st.dataframe(diagnostico(con_p, "personalidad"), width="stretch")
@@ -547,7 +681,7 @@ elif pantalla.startswith("4"):
     st.subheader("Motor adaptativo")
     ss.descuento = st.slider("Peso de los datos antiguos (1 = todos pesan igual; menor = se adapta más rápido)",
                              0.70, 1.00, float(ss.descuento), 0.01)
-    post = posteriores(ss.df, "formato", list(ss.formatos), ss.descuento)
+    post = posteriores(base_df, "formato", list(ss.formatos), ss.descuento)
     st.dataframe(post[["piezas", "media_%"]].rename(columns={"media_%": "tasa_envios_esperada_%"}).round(2),
                  width="stretch")
     st.caption("Las opciones sin datos parten de la tasa global de la cuenta y el motor las irá probando.")
@@ -662,7 +796,8 @@ elif pantalla.startswith("8"):
         c1, c2, c3 = st.columns(3)
         titulo = c1.text_input("Título de la pieza")
         formato = c2.selectbox("Formato", list(ss.formatos))
-        persona = c3.selectbox("Personalidad (si aplica)", [""] + [p["personalidad"] for p in ss.personalidades])
+        persona = c3.selectbox("Personalidad (si aplica)", ["Ninguna"] + [p["personalidad"] for p in ss.personalidades])
+        persona = "" if persona == "Ninguna" else persona
         angulo = st.text_input("Ángulo o inspiración")
         c4, c5, c6, c7 = st.columns(4)
         esp = c4.number_input("Espectadores", 0, step=1)
