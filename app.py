@@ -441,17 +441,26 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def modelo_gemini(clave):
-    """Busca un modelo Flash disponible para la clave (los nombres cambian con el tiempo)."""
+def modelo_gemini(clave, preferido=""):
+    """Elige un modelo disponible para la clave. Los nombres de los modelos cambian con el tiempo,
+    así que se consultan en vivo. Se puede fijar uno con GEMINI_MODEL en los Secrets."""
+    if preferido:
+        return preferido if preferido.startswith("models/") else f"models/{preferido}"
     r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
     r.raise_for_status()
     nombres = [m["name"] for m in r.json().get("models", [])
-               if "generateContent" in m.get("supportedGenerationMethods", []) and "flash" in m["name"]]
-    estables = [n for n in nombres if "preview" not in n and "exp" not in n and "lite" not in n]
-    elegido = (sorted(estables) or sorted(nombres))
-    if not elegido:
-        raise RuntimeError("No hay modelos Flash disponibles para esta clave.")
-    return elegido[-1]
+               if "generateContent" in m.get("supportedGenerationMethods", [])
+               and not any(x in m["name"] for x in ["embedding", "aqa", "image", "tts", "audio", "vision"])]
+    if not nombres:
+        raise RuntimeError("No hay modelos de texto disponibles para esta clave.")
+    estable = lambda n: "preview" not in n and "exp" not in n
+    for filtro in (lambda n: "flash" in n and "lite" not in n and estable(n),
+                   lambda n: "flash" in n,
+                   lambda n: "pro" not in n and estable(n),
+                   lambda n: True):
+        candidatos = sorted(n for n in nombres if filtro(n))
+        if candidatos:
+            return candidatos[-1]
 
 
 def escribir_guion_ia(idea, marca, reglas, clave):
@@ -462,7 +471,7 @@ def escribir_guion_ia(idea, marca, reglas, clave):
         "3. Música o ambiente sugerido.\n"
         "4. Descripción para la publicación (máximo 3 líneas) y 5 hashtags.\n"
         "No inventes datos de precios, materiales ni certificaciones que no aparezcan aquí.")
-    modelo = modelo_gemini(clave)
+    modelo = modelo_gemini(clave, st.secrets.get("GEMINI_MODEL", "") if hasattr(st, "secrets") else "")
     r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=60,
                       json={"contents": [{"parts": [{"text": instruccion}]}]})
     if r.status_code == 429:
@@ -471,6 +480,90 @@ def escribir_guion_ia(idea, marca, reglas, clave):
     r.raise_for_status()
     partes = r.json()["candidates"][0]["content"]["parts"]
     return "".join(p.get("text", "") for p in partes).strip()
+
+
+def _texto_respuesta(js):
+    """Extrae el texto de la respuesta, sea de generateContent o de interactions."""
+    if "candidates" in js:
+        return "".join(p.get("text", "") for p in js["candidates"][0]["content"]["parts"]).strip()
+    textos = []
+    def buscar(x):
+        if isinstance(x, dict):
+            if x.get("type") == "text" and isinstance(x.get("text"), str):
+                textos.append(x["text"])
+            for v in x.values():
+                buscar(v)
+        elif isinstance(x, list):
+            for v in x:
+                buscar(v)
+    buscar(js.get("outputs", js))
+    return "\n".join(textos).strip()
+
+
+def voz_desde_video(datos, mime, idea, marca, reglas, clave, preferido=""):
+    """Sube el video a Gemini (Files API), espera a que se procese y pide una voz en off
+    sincronizada con lo que se ve. El archivo se borra al terminar."""
+    import time
+    h = {"x-goog-api-key": clave}
+    ini = requests.post("https://generativelanguage.googleapis.com/upload/v1beta/files", timeout=60,
+                        headers={**h, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                                 "X-Goog-Upload-Header-Content-Length": str(len(datos)),
+                                 "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": "application/json"},
+                        json={"file": {"display_name": "video_reel"}})
+    ini.raise_for_status()
+    url = ini.headers.get("x-goog-upload-url")
+    sub = requests.post(url, data=datos, timeout=300,
+                        headers={"Content-Length": str(len(datos)), "X-Goog-Upload-Offset": "0",
+                                 "X-Goog-Upload-Command": "upload, finalize"})
+    sub.raise_for_status()
+    archivo = sub.json()["file"]
+    nombre, uri = archivo["name"], archivo["uri"]
+    try:
+        for _ in range(40):  # hasta ~2 minutos
+            estado = requests.get(f"{GEMINI_URL}/{nombre}", headers=h, timeout=30).json().get("state", "")
+            if estado == "ACTIVE":
+                break
+            if estado == "FAILED":
+                raise RuntimeError("Google no pudo procesar el video.")
+            time.sleep(3)
+        else:
+            raise RuntimeError("El video tardó demasiado en procesarse. Intenta con uno más corto o liviano.")
+        es_tec = idea.get("permite_tecnica")
+        reglas_txt = "; ".join(f"evita «{r['evitar']}» ({r['usar']})" for r in reglas
+                               if r.get("evitar") and not (es_tec and r.get("es_tecnica")))
+        persona = (f"La voz debe sonar como una mujer de personalidad {idea['personalidad']}. "
+                   if idea.get("personalidad") else "")
+        instruccion = (
+            f"Eres guionista de voz en off para {marca}, una marca de accesorios hechos a mano con diseño de autor. "
+            f"Su propósito: que cada mujer pierda el miedo a usar lo que la hace sentir ella misma.\n"
+            f"Mira el video completo (no tiene audio). Escribe la voz en off sobre «{idea['angulo']}», "
+            f"formato «{idea['formato']}», objetivo {idea['objetivo']}. {persona}\n"
+            "Entrega la voz en off dividida por marcas de tiempo MM:SS que coincidan EXACTAMENTE con lo que se ve "
+            "en cada toma. Para cada tramo: [MM:SS-MM:SS] lo que se ve (breve) → texto de la voz en off. "
+            "El texto de cada tramo debe poder leerse en voz alta en el tiempo de ese tramo (unas 2 a 3 palabras "
+            "por segundo). Termina con un llamado a la acción implícito. Español de Colombia.\n"
+            f"Reglas de marca: {reglas_txt}. No inventes precios, materiales ni certificaciones.")
+        modelo = modelo_gemini(clave, preferido)
+        r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", headers=h, timeout=180,
+                          json={"contents": [{"parts": [{"file_data": {"mime_type": mime, "file_uri": uri}},
+                                                        {"text": instruccion}]}]})
+        if r.status_code == 429:
+            raise RuntimeError("Se alcanzó el límite gratuito de la IA por hoy. Intenta más tarde.")
+        if r.status_code >= 400:  # formato alternativo de la API
+            r = requests.post(f"{GEMINI_URL}/interactions", headers=h, timeout=180,
+                              json={"model": modelo.replace("models/", ""),
+                                    "input": [{"type": "video", "uri": uri, "mime_type": mime},
+                                              {"type": "text", "text": instruccion}]})
+        r.raise_for_status()
+        texto = _texto_respuesta(r.json())
+        if not texto:
+            raise RuntimeError("La IA no devolvió texto.")
+        return texto
+    finally:
+        try:  # privacidad: no dejar el video en los servidores de Google
+            requests.delete(f"{GEMINI_URL}/{nombre}", headers=h, timeout=30)
+        except Exception:
+            pass
 
 
 def clave_ia():
@@ -870,6 +963,28 @@ elif pantalla.startswith("6"):
                                     ss.marca["nombre"] or "la marca", ss.reglas, clave)
                         except Exception as e:
                             st.error(f"No se pudo generar el guion: {e}")
+                if idea["tipo"] == "Reel":
+                    with st.popover("🎬 Voz en off según mi video"):
+                        st.caption("Sube el video ya grabado (sin audio, máximo 1 minuto). La IA lo mira y escribe la "
+                                   "voz en off sincronizada con cada toma. El video se borra de Google al terminar.")
+                        video = st.file_uploader("Video", type=["mp4", "mov", "webm"], key=f"v{i}")
+                        if video and st.button("Escribir voz en off", key=f"vb{i}", type="primary"):
+                            clave = clave_ia()
+                            if not clave:
+                                st.info("La IA no está configurada (falta GEMINI_API_KEY en los Secrets).")
+                            elif video.size > 100 * 1024 * 1024:
+                                st.error("El video pesa más de 100 MB. Expórtalo en menor calidad e intenta de nuevo.")
+                            else:
+                                try:
+                                    with st.spinner("Subiendo y analizando el video… (puede tardar hasta 2 minutos)"):
+                                        mime = {"mov": "video/quicktime", "webm": "video/webm"}.get(
+                                            video.name.rsplit(".", 1)[-1].lower(), "video/mp4")
+                                        idea["guion_ia"] = voz_desde_video(
+                                            video.getvalue(), mime, idea, ss.marca["nombre"] or "la marca",
+                                            ss.reglas, clave, st.secrets.get("GEMINI_MODEL", ""))
+                                    st.success("Listo. La voz en off aparece abajo, en «Guion completo».")
+                                except Exception as e:
+                                    st.error(f"No se pudo analizar el video: {e}")
                 if idea.get("guion_ia"):
                     idea["guion_ia"] = st.text_area("Guion completo (IA, editable antes de aprobar)",
                                                     idea["guion_ia"], key=f"gi{i}", height=320)
