@@ -7,6 +7,7 @@ Ejecutar en local:  streamlit run app.py
 """
 import json
 import re
+import uuid
 from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
@@ -417,12 +418,13 @@ def guion(nombre, formato, angulo, pilar, objetivo, persona, rng):
             "pilar": pilar,
             "objetivo": objetivo, "personalidad": datos["personalidad"], "gancho": gancho, "pasos": pasos,
             "horas": float(formato["horas"]), "permite_tecnica": bool(formato.get("permite_tecnica")),
-            "aprobada": False}
+            "aprobada": False, "uid": uuid.uuid4().hex[:8]}
 
 
 def prompt_ia(idea, marca, reglas):
     pasos = "\n".join(f"- {t}: {d}" for t, d in idea["pasos"])
-    reglas_txt = "; ".join(f"evita «{r['evitar']}» ({r['usar']})" for r in reglas
+    reglas_txt = "; ".join(f"no escribas «{r['evitar']}» (si hace falta referirse a eso: {r['usar']})"
+                           for r in reglas
                            if r.get("evitar") and not (idea["permite_tecnica"] and r.get("es_tecnica")))
     extra = (f"La voz y el estilo deben sentirse como una mujer de personalidad {idea['personalidad']}. "
              if idea.get("personalidad") else "")
@@ -433,9 +435,14 @@ def prompt_ia(idea, marca, reglas):
         f"Mejora este {idea['tipo'].lower()} de formato «{idea['formato']}» sobre «{idea['angulo']}» "
         f"(pilar: {idea['pilar']}; objetivo: {idea['objetivo']}). {extra}{duracion}\n"
         f"Mantén la estructura, haz el gancho más específico y conserva un llamado a la acción implícito.\n"
-        f"Reglas de marca: {reglas_txt}.\n\n{pasos}"
+        f"Reglas de marca: {reglas_txt}. Las alternativas son solo para cuando el tema es necesario: "
+        f"no las menciones si no aportan.\n{ESTILO}\n\n{pasos}"
     )
 
+
+ESTILO = ("Estilo: lenguaje natural y cercano. Usa las expresiones de marca (diseño de autor, hecho a mano, "
+          "co-creación, alta moda, materiales) con moderación: cada una como máximo UNA vez en todo el texto, y "
+          "solo si aporta. Prioriza la emoción, la historia y lo que se ve en pantalla.")
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -558,7 +565,7 @@ def voz_desde_video(datos, mime, idea, marca, reglas, clave, preferido=""):
         else:
             raise RuntimeError("El video tardó demasiado en procesarse. Intenta con uno más corto o liviano.")
         es_tec = idea.get("permite_tecnica")
-        reglas_txt = "; ".join(f"evita «{r['evitar']}» ({r['usar']})" for r in reglas
+        reglas_txt = "; ".join(f"no escribas «{r['evitar']}» (si hace falta: {r['usar']})" for r in reglas
                                if r.get("evitar") and not (es_tec and r.get("es_tecnica")))
         persona = (f"La voz debe sonar como una mujer de personalidad {idea['personalidad']}. "
                    if idea.get("personalidad") else "")
@@ -571,7 +578,7 @@ def voz_desde_video(datos, mime, idea, marca, reglas, clave, preferido=""):
             "en cada toma. Para cada tramo: [MM:SS-MM:SS] lo que se ve (breve) → texto de la voz en off. "
             "El texto de cada tramo debe poder leerse en voz alta en el tiempo de ese tramo (unas 2 a 3 palabras "
             "por segundo). Termina con un llamado a la acción implícito. Español de Colombia.\n"
-            f"Reglas de marca: {reglas_txt}. No inventes precios, materiales ni certificaciones.")
+            f"Reglas de marca: {reglas_txt}. No inventes precios, materiales ni certificaciones.\n{ESTILO}")
         texto, _ = llamar_gemini(clave, [{"file_data": {"mime_type": mime, "file_uri": uri}}, {"text": instruccion}],
                                  alterno=[{"type": "video", "uri": uri, "mime_type": mime},
                                           {"type": "text", "text": instruccion}], timeout=180)
@@ -583,6 +590,16 @@ def voz_desde_video(datos, mime, idea, marca, reglas, clave, preferido=""):
             requests.delete(f"{GEMINI_URL}/{nombre}", headers=h, timeout=30)
         except Exception:
             pass
+
+
+def ajustar_guion_ia(guion_actual, ajuste, marca, reglas, permite_tecnica, clave):
+    reglas_txt = "; ".join(f"no escribas «{r['evitar']}»" for r in reglas
+                           if r.get("evitar") and not (permite_tecnica and r.get("es_tecnica")))
+    instruccion = (f"Eres guionista de contenido para {marca}. Este es el guion actual:\n\n{guion_actual}\n\n"
+                   f"Aplica SOLO este ajuste y conserva todo lo demás (estructura, tiempos y secciones): {ajuste}\n"
+                   f"Reglas de marca: {reglas_txt}.\n{ESTILO}\nDevuelve el guion completo ya ajustado.")
+    texto, _ = llamar_gemini(clave, [{"text": instruccion}])
+    return texto
 
 
 def clave_ia():
@@ -790,8 +807,9 @@ elif pantalla.startswith("2"):
         st.write("Los cambios solo duran en esta sesión. Descarga tu configuración para volver a cargarla después.")
         config = {"marca": ss.marca, "formatos": ss.formatos, "personalidades": ss.personalidades,
                   "reglas": ss.reglas, "muestra": ss.muestra.dropna(how="all").to_dict("records"),
-                  "candidatos": ss.candidatos}
-        st.download_button("Descargar mi configuración", json.dumps(config, ensure_ascii=False, indent=2),
+                  "candidatos": ss.candidatos, "ideas": ss.ideas}
+        st.caption("Incluye también las ideas y guiones de la semana (aprobados o no).")
+        st.download_button("Descargar mi configuración", json.dumps(config, ensure_ascii=False, indent=2, default=str),
                            "configuracion_marca.json", "application/json")
         arch = st.file_uploader("Cargar una configuración guardada", type="json")
         if arch and st.button("Aplicar configuración"):
@@ -799,6 +817,14 @@ elif pantalla.startswith("2"):
             for k in ["marca", "formatos", "personalidades", "reglas", "candidatos"]:
                 if k in cfg:
                     ss[k] = cfg[k]
+            if "ideas" in cfg:
+                ideas = []
+                for x in cfg["ideas"]:
+                    x["pasos"] = [tuple(p) for p in x.get("pasos", [])]
+                    if x.get("fecha_fija"):
+                        x["fecha_fija"] = date.fromisoformat(str(x["fecha_fija"])[:10])
+                    ideas.append(x)
+                ss.ideas = ideas
             if "muestra" in cfg:
                 ss.muestra = pd.DataFrame(cfg["muestra"], columns=["angulo", "cantidad"])
             reiniciar_editores()
@@ -966,6 +992,25 @@ elif pantalla.startswith("6"):
                     st.success(f"La IA responde correctamente con el modelo: {usado}")
                 except Exception as e:
                     st.error(f"{e}")
+    with st.expander("💾 Guardar o recuperar mis ideas y guiones"):
+        st.caption("Descarga tus ideas (incluidos los guiones y las aprobadas) antes de cerrar la app o de "
+                   "actualizarla. La próxima vez las cargas aquí y sigues donde ibas.")
+        if ss.ideas:
+            exportar = [{**x, "pasos": [list(p) for p in x["pasos"]],
+                         "fecha_fija": str(x["fecha_fija"]) if x.get("fecha_fija") else None} for x in ss.ideas]
+            st.download_button("Descargar mis ideas", json.dumps(exportar, ensure_ascii=False, indent=2),
+                               "ideas_y_guiones.json", "application/json")
+        arch_i = st.file_uploader("Cargar ideas guardadas", type="json", key="up_ideas")
+        if arch_i and st.button("Recuperar ideas"):
+            cargadas = json.load(arch_i)
+            for x in cargadas:
+                x["pasos"] = [tuple(p) for p in x.get("pasos", [])]
+                if x.get("fecha_fija"):
+                    x["fecha_fija"] = date.fromisoformat(x["fecha_fija"])
+                x["v"] = x.get("v", 0) + 1
+            ss.ideas = cargadas
+            st.success(f"{len(cargadas)} ideas recuperadas.")
+            st.rerun()
     with st.expander("➕ Agregar una idea puntual (sin cambiar el resto de la semana)"):
         with st.form("puntual", clear_on_submit=True):
             c1, c2 = st.columns(2)
@@ -987,16 +1032,22 @@ elif pantalla.startswith("6"):
                     nueva.update(puntual=True, fecha_fija=fecha_p)
                     ss.ideas.append(nueva)
                     st.success("Idea agregada. Revísala abajo, escríbele el guion y apruébala.")
+    st.caption("«Generar la semana» conserva las ideas que ya aprobaste y las puntuales; solo propone las que faltan.")
     if st.button("Generar la semana", type="primary"):
-        puntuales = [x for x in ss.ideas if x.get("puntual")]
-        ss.ideas = puntuales + generar_semana(ss.df, ss.formatos, ss.personalidades, ss.marca["piezas"], angulos, pilares,
-                                  ss.descuento, rng)
+        # Se conservan las ideas aprobadas y las puntuales; solo se generan los espacios que faltan
+        conservar = [x for x in ss.ideas if x.get("puntual") or x.get("aprobada")]
+        faltan = {t: max(0, int(ss.marca["piezas"].get(t, 0)) -
+                         sum(1 for x in conservar if x["tipo"] == t and not x.get("puntual")))
+                  for t in TIPOS}
+        ss.ideas = conservar + generar_semana(ss.df, ss.formatos, ss.personalidades, faltan, angulos, pilares,
+                                              ss.descuento, rng)
     personas = {p["personalidad"]: p for p in ss.personalidades}
     for tipo in TIPOS:
         grupo = [(i, x) for i, x in enumerate(ss.ideas) if x["tipo"] == tipo]
         if grupo:
             st.subheader(f"{tipo}s")
         for i, idea in grupo:
+            idea.setdefault("uid", uuid.uuid4().hex[:8])
             titulo = f"{idea['formato']} · {idea['angulo']} · objetivo {idea['objetivo']}"
             if idea.get("referencia"):
                 titulo += f" · ref. interna: {idea['referencia']}"
@@ -1006,7 +1057,7 @@ elif pantalla.startswith("6"):
                 titulo += f" · {idea['personalidad']}"
             with st.expander(titulo, expanded=not idea["aprobada"]):
                 texto = st.text_area("Guion (editable)", "\n".join(f"{t}: {d}" for t, d in idea["pasos"]),
-                                     key=f"g{i}", height=180)
+                                     key=f"g{idea['uid']}_{idea.get('v', 0)}", height=180)
                 for a in revisar_reglas(texto, ss.reglas, idea["permite_tecnica"]):
                     st.warning(a)
                 if st.button("✨ Escribir guion completo con IA", key=f"ia{i}"):
@@ -1018,6 +1069,7 @@ elif pantalla.startswith("6"):
                         try:
                             with st.spinner("Escribiendo el guion…"):
                                 idea["pasos"] = [(t, d) for t, d in idea["pasos"]]
+                                idea["v"] = idea.get("v", 0) + 1
                                 idea["guion_ia"] = escribir_guion_ia(
                                     {**idea, "pasos": [(t, d) for t, d in
                                                        [l.split(": ", 1) if ": " in l else ("", l)
@@ -1029,7 +1081,7 @@ elif pantalla.startswith("6"):
                     with st.popover("🎬 Voz en off según mi video"):
                         st.caption("Sube el video ya grabado (sin audio, máximo 1 minuto). La IA lo mira y escribe la "
                                    "voz en off sincronizada con cada toma. El video se borra de Google al terminar.")
-                        video = st.file_uploader("Video", type=["mp4", "mov", "webm"], key=f"v{i}")
+                        video = st.file_uploader("Video", type=["mp4", "mov", "webm"], key=f"v{idea['uid']}")
                         if video and st.button("Escribir voz en off", key=f"vb{i}", type="primary"):
                             clave = clave_ia()
                             if not clave:
@@ -1041,6 +1093,7 @@ elif pantalla.startswith("6"):
                                     with st.spinner("Subiendo y analizando el video… (puede tardar hasta 2 minutos)"):
                                         mime = {"mov": "video/quicktime", "webm": "video/webm"}.get(
                                             video.name.rsplit(".", 1)[-1].lower(), "video/mp4")
+                                        idea["v"] = idea.get("v", 0) + 1
                                         idea["guion_ia"] = voz_desde_video(
                                             video.getvalue(), mime, idea, ss.marca["nombre"] or "la marca",
                                             ss.reglas, clave, st.secrets.get("GEMINI_MODEL", ""))
@@ -1049,7 +1102,31 @@ elif pantalla.startswith("6"):
                                     st.error(f"No se pudo analizar el video: {e}")
                 if idea.get("guion_ia"):
                     idea["guion_ia"] = st.text_area("Guion completo (IA, editable antes de aprobar)",
-                                                    idea["guion_ia"], key=f"gi{i}", height=320)
+                                                    idea["guion_ia"], key=f"gi{idea['uid']}_{idea.get('v', 0)}", height=320)
+                    ca, cb = st.columns([4, 1])
+                    ajuste = ca.text_input("¿Qué quieres cambiar?", key=f"aj{idea['uid']}_{idea.get('v', 0)}",
+                                           placeholder="Ej.: no repitas «diseño de autor»; quita lo del alambre "
+                                                       "dorado; hazlo más divertido; acórtalo a 30 segundos")
+                    cb.write("")
+                    if cb.button("Ajustar con IA", key=f"ajb{i}") and ajuste.strip():
+                        clave = clave_ia()
+                        if not clave:
+                            st.info("La IA no está configurada (falta GEMINI_API_KEY en los Secrets).")
+                        else:
+                            try:
+                                with st.spinner("Ajustando el guion…"):
+                                    nuevo = ajustar_guion_ia(idea["guion_ia"], ajuste, ss.marca["nombre"] or "la marca",
+                                                             ss.reglas, idea["permite_tecnica"], clave)
+                                idea["guion_anterior"] = idea["guion_ia"]
+                                idea["guion_ia"] = nuevo
+                                idea["v"] = idea.get("v", 0) + 1
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"No se pudo ajustar: {e}")
+                    if idea.get("guion_anterior") and st.button("↩ Deshacer el último ajuste", key=f"un{i}"):
+                        idea["guion_ia"], idea["guion_anterior"] = idea["guion_anterior"], None
+                        idea["v"] = idea.get("v", 0) + 1
+                        st.rerun()
                     for a in revisar_reglas(idea["guion_ia"], ss.reglas, idea["permite_tecnica"]):
                         st.warning(a)
                     st.caption("Revisa el guion antes de aprobarlo: la IA puede equivocarse. "
@@ -1058,15 +1135,31 @@ elif pantalla.startswith("6"):
                 if c1.button("Aprobar", key=f"a{i}"):
                     idea["aprobada"] = True
                     idea["texto"] = idea.get("guion_ia") or texto
-                if c2.button("Regenerar", key=f"r{i}"):
+                if c2.button("Regenerar texto", key=f"r{i}",
+                             help="Conserva el tema, el formato y la personalidad; cambia el texto."):
                     persona = personas.get(idea.get("personalidad")) or (
                         ss.personalidades[rng.integers(len(ss.personalidades))] if ss.personalidades else None)
-                    ss.ideas[i] = guion(idea["formato"], ss.formatos[idea["formato"]], rng.choice(angulos),
-                                        rng.choice(pilares), idea["objetivo"], persona, rng)
+                    tema = f"{idea['referencia']} | {idea['angulo']}" if idea.get("referencia") else idea["angulo"]
+                    nueva = guion(idea["formato"], ss.formatos[idea["formato"]], tema, idea["pilar"],
+                                  idea["objetivo"], persona, rng)
+                    nueva.update({k: idea[k] for k in ("puntual", "fecha_fija") if k in idea})
+                    nueva["v"] = idea.get("v", 0) + 1
+                    clave = clave_ia()
+                    if clave:  # con IA disponible, el texto nuevo es un guion completo distinto
+                        try:
+                            with st.spinner("Escribiendo otra versión…"):
+                                nueva["guion_ia"] = escribir_guion_ia(nueva, ss.marca["nombre"] or "la marca",
+                                                                      ss.reglas, clave)
+                        except Exception:
+                            pass
+                    ss.ideas[i] = nueva
                     st.rerun()
-                c3.download_button("Instrucción para tu asistente de IA",
-                                   prompt_ia(idea, ss.marca["nombre"] or "la marca", ss.reglas),
-                                   f"prompt_{i+1}.txt", key=f"p{i}")
+                with c3.popover("Instrucción para tu asistente de IA"):
+                    st.caption("Copia con el ícono de la esquina superior derecha y pégalo en tu asistente de IA.")
+                    base = prompt_ia(idea, ss.marca["nombre"] or "la marca", ss.reglas)
+                    if idea.get("guion_ia"):
+                        base += "\n\nGuion actual (ajústalo según lo que te pida):\n" + idea["guion_ia"]
+                    st.code(base, language=None, wrap_lines=True)
                 if c4.button("Descartar", key=f"d{i}"):
                     ss.ideas.pop(i)
                     st.rerun()
@@ -1090,7 +1183,8 @@ elif pantalla.startswith("7"):
             dia = x.get("fecha_fija") or inicio + timedelta(days=(j * 7) // len(grupo))
             filas.append({"fecha": dia, "dia": DIAS[dia.weekday()], "tipo": tipo, "formato": x["formato"],
                           "angulo": x["angulo"], "referencia_interna": x.get("referencia", ""), "personalidad": x.get("personalidad", ""), "pilar": x["pilar"],
-                          "objetivo": x["objetivo"], "horas": x["horas"], "gancho": x["gancho"]})
+                          "objetivo": x["objetivo"], "horas": x["horas"], "gancho": x["gancho"],
+                          "guion": x.get("texto") or x.get("guion_ia") or ""})
     ss.parrilla = pd.DataFrame(filas).sort_values(["fecha", "tipo"]).reset_index(drop=True)
     horas = ss.parrilla["horas"].sum()
     if horas > ss.marca["horas"]:
