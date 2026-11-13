@@ -442,27 +442,28 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def modelos_gemini(clave, preferido=""):
-    """Lista ordenada de modelos a intentar. Los nombres cambian con el tiempo, así que se consultan en vivo.
-    Primero el fijado en GEMINI_MODEL (si existe), luego Flash, Flash-Lite y el resto."""
+    """Lista ordenada de modelos de texto a intentar. Los nombres cambian con el tiempo, así que se
+    consultan en vivo. Orden: el fijado en GEMINI_MODEL, «flash-latest», Flash por versión (más nueva
+    primero), Flash-Lite y, al final, los demás modelos estables."""
     r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
     r.raise_for_status()
-    nombres = [m["name"] for m in r.json().get("models", [])
+    excluir = ["embedding", "aqa", "image", "tts", "audio", "vision", "live", "omni", "robotics", "computer-use",
+               "deep-research", "antigravity", "lyria", "gemma", "banana", "transcribe", "customtools", "pro"]
+    nombres = [m["name"].replace("models/", "") for m in r.json().get("models", [])
                if "generateContent" in m.get("supportedGenerationMethods", [])
-               and not any(x in m["name"] for x in ["embedding", "aqa", "image", "tts", "audio", "vision", "live"])]
+               and not any(x in m["name"] for x in excluir)]
     estable = lambda n: "preview" not in n and "exp" not in n
-    orden = []
-    for filtro in (lambda n: "flash" in n and "lite" not in n and estable(n),
-                   lambda n: "flash" in n and estable(n),
-                   lambda n: "flash" in n,
-                   lambda n: "pro" not in n and estable(n),
-                   lambda n: True):
-        orden += [n for n in sorted(nombres, reverse=True) if filtro(n) and n not in orden]
+    version = lambda n: [int(x) for x in re.findall(r"\d+", n)] or [0]
+    flash = sorted([n for n in nombres if re.fullmatch(r"gemini-[\d.]+-flash", n)], key=version, reverse=True)
+    lite = sorted([n for n in nombres if re.fullmatch(r"gemini-[\d.]+-flash-lite", n)], key=version, reverse=True)
+    orden = [n for n in ["gemini-flash-latest"] if n in nombres] + flash
+    orden += [n for n in ["gemini-flash-lite-latest"] if n in nombres] + lite
+    orden += [n for n in nombres if estable(n) and n not in orden]
     if preferido:
-        pref = preferido if preferido.startswith("models/") else f"models/{preferido}"
-        orden = [pref] + [n for n in orden if n != pref]
+        orden = [preferido.replace("models/", "")] + [n for n in orden if n != preferido.replace("models/", "")]
     if not orden:
         raise RuntimeError("No hay modelos de texto disponibles para esta clave.")
-    return orden
+    return ["models/" + n for n in orden]
 
 
 def modelo_preferido():
@@ -472,16 +473,20 @@ def modelo_preferido():
         return ""
 
 
-def llamar_gemini(clave, partes, alterno=None, timeout=90):
+def llamar_gemini(clave, partes, alterno=None, timeout=60):
     """Intenta los modelos en orden. Si uno no tiene cupo (429) o no está disponible (403/404),
     pasa al siguiente. Devuelve (texto, modelo usado)."""
     errores = []
     for modelo in modelos_gemini(clave, modelo_preferido())[:6]:
-        r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=timeout,
-                          json={"contents": [{"parts": partes}]})
-        if r.status_code >= 400 and r.status_code not in (403, 404, 429) and alterno:
-            r = requests.post(f"{GEMINI_URL}/interactions", params={"key": clave}, timeout=timeout,
-                              json={"model": modelo.replace("models/", ""), "input": alterno})
+        try:
+            r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=timeout,
+                              json={"contents": [{"parts": partes}]})
+            if r.status_code >= 400 and r.status_code not in (403, 404, 429) and alterno:
+                r = requests.post(f"{GEMINI_URL}/interactions", params={"key": clave}, timeout=timeout,
+                                  json={"model": modelo.replace("models/", ""), "input": alterno})
+        except requests.exceptions.RequestException:
+            errores.append(f"{modelo.replace('models/', '')}: no respondió a tiempo")
+            continue
         if r.status_code in (403, 404, 429):
             errores.append(f"{modelo.replace('models/', '')}: código {r.status_code}")
             continue
