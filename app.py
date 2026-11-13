@@ -441,26 +441,57 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def modelo_gemini(clave, preferido=""):
-    """Elige un modelo disponible para la clave. Los nombres de los modelos cambian con el tiempo,
-    así que se consultan en vivo. Se puede fijar uno con GEMINI_MODEL en los Secrets."""
-    if preferido:
-        return preferido if preferido.startswith("models/") else f"models/{preferido}"
+def modelos_gemini(clave, preferido=""):
+    """Lista ordenada de modelos a intentar. Los nombres cambian con el tiempo, así que se consultan en vivo.
+    Primero el fijado en GEMINI_MODEL (si existe), luego Flash, Flash-Lite y el resto."""
     r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
     r.raise_for_status()
     nombres = [m["name"] for m in r.json().get("models", [])
                if "generateContent" in m.get("supportedGenerationMethods", [])
-               and not any(x in m["name"] for x in ["embedding", "aqa", "image", "tts", "audio", "vision"])]
-    if not nombres:
-        raise RuntimeError("No hay modelos de texto disponibles para esta clave.")
+               and not any(x in m["name"] for x in ["embedding", "aqa", "image", "tts", "audio", "vision", "live"])]
     estable = lambda n: "preview" not in n and "exp" not in n
+    orden = []
     for filtro in (lambda n: "flash" in n and "lite" not in n and estable(n),
+                   lambda n: "flash" in n and estable(n),
                    lambda n: "flash" in n,
                    lambda n: "pro" not in n and estable(n),
                    lambda n: True):
-        candidatos = sorted(n for n in nombres if filtro(n))
-        if candidatos:
-            return candidatos[-1]
+        orden += [n for n in sorted(nombres, reverse=True) if filtro(n) and n not in orden]
+    if preferido:
+        pref = preferido if preferido.startswith("models/") else f"models/{preferido}"
+        orden = [pref] + [n for n in orden if n != pref]
+    if not orden:
+        raise RuntimeError("No hay modelos de texto disponibles para esta clave.")
+    return orden
+
+
+def modelo_preferido():
+    try:
+        return st.secrets.get("GEMINI_MODEL", "")
+    except Exception:
+        return ""
+
+
+def llamar_gemini(clave, partes, alterno=None, timeout=90):
+    """Intenta los modelos en orden. Si uno no tiene cupo (429) o no está disponible (403/404),
+    pasa al siguiente. Devuelve (texto, modelo usado)."""
+    errores = []
+    for modelo in modelos_gemini(clave, modelo_preferido())[:6]:
+        r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=timeout,
+                          json={"contents": [{"parts": partes}]})
+        if r.status_code >= 400 and r.status_code not in (403, 404, 429) and alterno:
+            r = requests.post(f"{GEMINI_URL}/interactions", params={"key": clave}, timeout=timeout,
+                              json={"model": modelo.replace("models/", ""), "input": alterno})
+        if r.status_code in (403, 404, 429):
+            errores.append(f"{modelo.replace('models/', '')}: código {r.status_code}")
+            continue
+        r.raise_for_status()
+        texto = _texto_respuesta(r.json())
+        if texto:
+            return texto, modelo.replace("models/", "")
+        errores.append(f"{modelo.replace('models/', '')}: sin texto")
+    raise RuntimeError("Ningún modelo tuvo cupo disponible ahora (" + "; ".join(errores) +
+                       "). Intenta más tarde o usa «Instrucción para tu asistente de IA».")
 
 
 def escribir_guion_ia(idea, marca, reglas, clave):
@@ -471,15 +502,8 @@ def escribir_guion_ia(idea, marca, reglas, clave):
         "3. Música o ambiente sugerido.\n"
         "4. Descripción para la publicación (máximo 3 líneas) y 5 hashtags.\n"
         "No inventes datos de precios, materiales ni certificaciones que no aparezcan aquí.")
-    modelo = modelo_gemini(clave, st.secrets.get("GEMINI_MODEL", "") if hasattr(st, "secrets") else "")
-    r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=60,
-                      json={"contents": [{"parts": [{"text": instruccion}]}]})
-    if r.status_code == 429:
-        raise RuntimeError("Se alcanzó el límite gratuito de la IA por hoy. Intenta más tarde o usa "
-                           "«Instrucción para tu asistente de IA».")
-    r.raise_for_status()
-    partes = r.json()["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in partes).strip()
+    texto, _ = llamar_gemini(clave, [{"text": instruccion}])
+    return texto
 
 
 def _texto_respuesta(js):
@@ -543,19 +567,9 @@ def voz_desde_video(datos, mime, idea, marca, reglas, clave, preferido=""):
             "El texto de cada tramo debe poder leerse en voz alta en el tiempo de ese tramo (unas 2 a 3 palabras "
             "por segundo). Termina con un llamado a la acción implícito. Español de Colombia.\n"
             f"Reglas de marca: {reglas_txt}. No inventes precios, materiales ni certificaciones.")
-        modelo = modelo_gemini(clave, preferido)
-        r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", headers=h, timeout=180,
-                          json={"contents": [{"parts": [{"file_data": {"mime_type": mime, "file_uri": uri}},
-                                                        {"text": instruccion}]}]})
-        if r.status_code == 429:
-            raise RuntimeError("Se alcanzó el límite gratuito de la IA por hoy. Intenta más tarde.")
-        if r.status_code >= 400:  # formato alternativo de la API
-            r = requests.post(f"{GEMINI_URL}/interactions", headers=h, timeout=180,
-                              json={"model": modelo.replace("models/", ""),
-                                    "input": [{"type": "video", "uri": uri, "mime_type": mime},
-                                              {"type": "text", "text": instruccion}]})
-        r.raise_for_status()
-        texto = _texto_respuesta(r.json())
+        texto, _ = llamar_gemini(clave, [{"file_data": {"mime_type": mime, "file_uri": uri}}, {"text": instruccion}],
+                                 alterno=[{"type": "video", "uri": uri, "mime_type": mime},
+                                          {"type": "text", "text": instruccion}], timeout=180)
         if not texto:
             raise RuntimeError("La IA no devolvió texto.")
         return texto
@@ -630,6 +644,24 @@ ss.setdefault("descuento", 0.9)
 ss.setdefault("meta_raw", None)
 rng = np.random.default_rng()
 
+ss.setdefault("ver", 0)
+
+
+def editor_estable(nombre, df_inicial, **kw):
+    """Tabla editable que no salta mientras se escribe: la tabla parte de una copia fija y solo se
+    reinicia cuando se carga una configuración (cambia ss.ver)."""
+    base = f"base_{nombre}"
+    if base not in ss:
+        ss[base] = df_inicial.copy()
+    return st.data_editor(ss[base], key=f"ed_{nombre}_{ss.ver}", **kw)
+
+
+def reiniciar_editores():
+    for k in [k for k in ss.keys() if str(k).startswith("base_")]:
+        del ss[k]
+    ss.ver += 1
+
+
 # ---------------------------------------------------------------------------
 # Bienvenida y autorización
 # ---------------------------------------------------------------------------
@@ -693,8 +725,8 @@ elif pantalla.startswith("2"):
                                  "fijo_semana": int(v.get("fijo_semana", 0) or 0),
                                  "permite_tecnica": v["permite_tecnica"], "usa_personalidad": v["usa_personalidad"]}
                                 for k, v in ss.formatos.items()])
-        editado = st.data_editor(resumen, disabled=["formato", "tipo"], hide_index=True, width="stretch",
-                                 key="ed_fmt",
+        editado = editor_estable("formatos", resumen, disabled=["formato", "tipo"], hide_index=True, width="stretch",
+
                                  column_config={"fijo_semana": st.column_config.NumberColumn(min_value=0, max_value=7,
                                                                                              step=1)})
         for r in editado.itertuples():
@@ -725,21 +757,23 @@ elif pantalla.startswith("2"):
                     ss.formatos[nombre.strip()] = {"tipo": tipo, "horas": horas, "permite_tecnica": tec,
                                                    "usa_personalidad": per, "estructura": estructura}
                     st.success(f"Formato «{nombre.strip()}» agregado.")
+                    ss.pop("base_formatos", None)
+                    ss.ver += 1
                     st.rerun()
 
     with t2:
         st.write("Catálogo de personalidades. **La app elige cuál proponer** con el motor adaptativo: prueba "
                  "todas, mide cuáles generan más envíos y las propone más. Puedes agregar o quitar personalidades.")
-        pdf = st.data_editor(pd.DataFrame(ss.personalidades), num_rows="dynamic", hide_index=True,
-                             width="stretch", key="ed_per")
+        pdf = editor_estable("personalidades", pd.DataFrame(ss.personalidades), num_rows="dynamic",
+                             hide_index=True, width="stretch")
         ss.personalidades = [r for r in pdf.fillna("").to_dict("records") if str(r["personalidad"]).strip()]
 
     with t3:
         st.write("Palabras que nunca deben aparecer. La app busca la palabra completa o su raíz "
                  "(«artesan» detecta artesanía y artesanal). Las reglas marcadas como «es_tecnica» no aplican "
                  "en los formatos que permiten mostrar técnica, como Artelier.")
-        rdf = st.data_editor(pd.DataFrame(ss.reglas), num_rows="dynamic", hide_index=True, width="stretch",
-                             key="ed_reg",
+        rdf = editor_estable("reglas", pd.DataFrame(ss.reglas), num_rows="dynamic", hide_index=True,
+                             width="stretch",
                              column_config={"es_tecnica": st.column_config.CheckboxColumn(default=False)})
         ss.reglas = [r for r in rdf.fillna({"usar": "", "es_tecnica": False}).to_dict("records")
                      if str(r.get("evitar", "")).strip()]
@@ -750,16 +784,20 @@ elif pantalla.startswith("2"):
     with t4:
         st.write("Los cambios solo duran en esta sesión. Descarga tu configuración para volver a cargarla después.")
         config = {"marca": ss.marca, "formatos": ss.formatos, "personalidades": ss.personalidades,
-                  "reglas": ss.reglas}
+                  "reglas": ss.reglas, "muestra": ss.muestra.dropna(how="all").to_dict("records"),
+                  "candidatos": ss.candidatos}
         st.download_button("Descargar mi configuración", json.dumps(config, ensure_ascii=False, indent=2),
                            "configuracion_marca.json", "application/json")
         arch = st.file_uploader("Cargar una configuración guardada", type="json")
         if arch and st.button("Aplicar configuración"):
             cfg = json.load(arch)
-            for k in ["marca", "formatos", "personalidades", "reglas"]:
+            for k in ["marca", "formatos", "personalidades", "reglas", "candidatos"]:
                 if k in cfg:
                     ss[k] = cfg[k]
-            st.success("Configuración cargada.")
+            if "muestra" in cfg:
+                ss.muestra = pd.DataFrame(cfg["muestra"], columns=["angulo", "cantidad"])
+            reiniciar_editores()
+            st.success("Configuración cargada: perfil, formatos, personalidades, reglas, radar e inspiraciones.")
 
 # ---------------------------------------------------------------------------
 # 3. Cargar datos
@@ -870,19 +908,21 @@ elif pantalla.startswith("5"):
     st.write("Revisa en Instagram el contenido más visible de una temática y anota cuántas veces aparece cada "
              "ángulo. Las filas «(ejemplo)» son solo guía: reemplázalas con tu conteo real.")
     st.text_input("Temática analizada", "Accesorios para el cabello")
-    ss.muestra = st.data_editor(ss.muestra, num_rows="dynamic", width="stretch",
+    ss.muestra = editor_estable("muestra", ss.muestra, num_rows="dynamic", width="stretch", hide_index=True,
                                 column_config={"cantidad": st.column_config.NumberColumn(min_value=0, step=1)})
     st.caption("Escribe un tema o inspiración por fila y presiona **Enter**. No tiene que ser una inspiración: "
                "puede ser cualquier tema, como «texturas del terciopelo» o «cómo combinarla con ropa de oficina». "
                "Si la inspiración es una persona o una marca, escribe **referencia interna | lo que se dice en "
                "público**. Ejemplo: «Shakira | la danza árabe y sus vestuarios con brillo». El guion solo usa la parte "
                "pública; la referencia queda como nota para el equipo.")
-    cand = st.data_editor(pd.DataFrame({"tema o inspiración": ss.candidatos or [""]}), num_rows="dynamic",
-                          hide_index=True, width="stretch", key="ed_cand")
+    cand = editor_estable("candidatos", pd.DataFrame({"tema o inspiración": ss.candidatos or [""]}),
+                          num_rows="dynamic", hide_index=True, width="stretch")
     ss.candidatos = [str(c).strip() for c in cand["tema o inspiración"].fillna("") if str(c).strip()]
     if st.button("Sugerir una inspiración"):
         sug = "Inspiración: " + rng.choice(BANCO_INSPIRACION)
         ss.candidatos.append(sug)
+        ss.pop("base_candidatos", None)
+        ss.ver += 1
         st.rerun()
     sat = saturacion(ss.muestra.dropna(), ss.candidatos)
     st.dataframe(sat, width="stretch")
@@ -904,6 +944,23 @@ elif pantalla.startswith("6"):
     if not angulos:
         angulos = ["Inspiración: " + x for x in BANCO_INSPIRACION]
     pilares = ss.marca["pilares"] or ["Marca"]
+    with st.expander("🔧 Diagnóstico de la IA"):
+        clave = clave_ia()
+        if not clave:
+            st.info("No hay clave configurada (GEMINI_API_KEY en los Secrets).")
+        else:
+            if st.button("Probar conexión"):
+                try:
+                    r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
+                    r.raise_for_status()
+                    nombres = [m["name"].replace("models/", "") for m in r.json().get("models", [])
+                               if "generateContent" in m.get("supportedGenerationMethods", [])]
+                    st.caption("Modelos disponibles para tu clave: " + ", ".join(nombres))
+                    with st.spinner("Probando…"):
+                        _, usado = llamar_gemini(clave, [{"text": "Responde solo: OK"}])
+                    st.success(f"La IA responde correctamente con el modelo: {usado}")
+                except Exception as e:
+                    st.error(f"{e}")
     with st.expander("➕ Agregar una idea puntual (sin cambiar el resto de la semana)"):
         with st.form("puntual", clear_on_submit=True):
             c1, c2 = st.columns(2)
