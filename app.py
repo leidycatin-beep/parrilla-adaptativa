@@ -445,7 +445,7 @@ def modelos_gemini(clave, preferido=""):
     """Lista ordenada de modelos de texto a intentar. Los nombres cambian con el tiempo, así que se
     consultan en vivo. Orden: el fijado en GEMINI_MODEL, «flash-latest», Flash por versión (más nueva
     primero), Flash-Lite y, al final, los demás modelos estables."""
-    r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
+    r = requests.get(f"{GEMINI_URL}/models", headers={"x-goog-api-key": clave}, timeout=20)
     r.raise_for_status()
     excluir = ["embedding", "aqa", "image", "tts", "audio", "vision", "live", "omni", "robotics", "computer-use",
                "deep-research", "antigravity", "lyria", "gemma", "banana", "transcribe", "customtools", "pro"]
@@ -479,18 +479,18 @@ def llamar_gemini(clave, partes, alterno=None, timeout=60):
     errores = []
     for modelo in modelos_gemini(clave, modelo_preferido())[:6]:
         try:
-            r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", params={"key": clave}, timeout=timeout,
+            r = requests.post(f"{GEMINI_URL}/{modelo}:generateContent", headers={"x-goog-api-key": clave}, timeout=timeout,
                               json={"contents": [{"parts": partes}]})
-            if r.status_code >= 400 and r.status_code not in (403, 404, 429) and alterno:
-                r = requests.post(f"{GEMINI_URL}/interactions", params={"key": clave}, timeout=timeout,
+            if r.status_code >= 400 and r.status_code not in (403, 404, 429) and r.status_code < 500 and alterno:
+                r = requests.post(f"{GEMINI_URL}/interactions", headers={"x-goog-api-key": clave}, timeout=timeout,
                                   json={"model": modelo.replace("models/", ""), "input": alterno})
         except requests.exceptions.RequestException:
             errores.append(f"{modelo.replace('models/', '')}: no respondió a tiempo")
             continue
-        if r.status_code in (403, 404, 429):
+        if r.status_code >= 400:
+            # 429 sin cupo, 403/404 no disponible, 5xx Google saturado: se prueba el siguiente modelo
             errores.append(f"{modelo.replace('models/', '')}: código {r.status_code}")
             continue
-        r.raise_for_status()
         texto = _texto_respuesta(r.json())
         if texto:
             return texto, modelo.replace("models/", "")
@@ -956,7 +956,7 @@ elif pantalla.startswith("6"):
         else:
             if st.button("Probar conexión"):
                 try:
-                    r = requests.get(f"{GEMINI_URL}/models", params={"key": clave}, timeout=20)
+                    r = requests.get(f"{GEMINI_URL}/models", headers={"x-goog-api-key": clave}, timeout=20)
                     r.raise_for_status()
                     nombres = [m["name"].replace("models/", "") for m in r.json().get("models", [])
                                if "generateContent" in m.get("supportedGenerationMethods", [])]
